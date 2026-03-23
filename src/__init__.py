@@ -1,2 +1,0 @@
-"""STELL-AI activation package."""
-
