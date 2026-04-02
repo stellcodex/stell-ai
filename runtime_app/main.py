@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 
 from runtime_app.lib.backend_client import get_file_context, get_rule_config
@@ -20,16 +21,43 @@ app = FastAPI(title="STELL.AI", version="1.0")
 
 FALLBACK_CONFLICT_FLAG = "decision_fallback_used"
 
+# Accepts scx_<uuid> or bare <uuid> (case-insensitive). Rejects path-traversal.
+_FILE_ID_RE = re.compile(
+    r"^(?:scx_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _validate_file_id(v: str | None) -> str | None:
+    if v is None:
+        return v
+    if not _FILE_ID_RE.match(v):
+        raise ValueError("file_id must be a valid SCX ID or UUID")
+    return v
+
 
 class PlanIn(BaseModel):
     prompt: str = Field(min_length=2, max_length=2000)
     file_id: str | None = None
+
+    @field_validator("file_id")
+    @classmethod
+    def validate_file_id(cls, v: str | None) -> str | None:
+        return _validate_file_id(v)
 
 
 class AnalyzeIn(BaseModel):
     file_id: str = Field(min_length=4, max_length=64)
     include_web_context: bool = False
     web_query: str | None = Field(default=None, max_length=240)
+
+    @field_validator("file_id")
+    @classmethod
+    def validate_file_id(cls, v: str) -> str:
+        result = _validate_file_id(v)
+        if result is None:
+            raise ValueError("file_id is required")
+        return result
 
 
 class DecideIn(BaseModel):
@@ -39,6 +67,11 @@ class DecideIn(BaseModel):
     rule_version: str | None = Field(default=None, max_length=48)
     geometry_meta: dict[str, Any] | None = None
     dfm_findings: dict[str, Any] | None = None
+
+    @field_validator("file_id")
+    @classmethod
+    def validate_file_id(cls, v: str | None) -> str | None:
+        return _validate_file_id(v)
 
 
 class MemoryWriteIn(BaseModel):
@@ -55,6 +88,11 @@ class MemorySearchIn(BaseModel):
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE/ILIKE metacharacters to prevent wildcard injection."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _normalize_decision_mode(mode: str | None) -> str:
@@ -77,13 +115,21 @@ def _severity_for_decision(value: Any) -> str:
     return "INFO"
 
 
+_PROCESS_TO_METHOD: dict[str, str] = {
+    "cnc_turning": "cnc",
+    "cnc_milling": "cnc",
+    "sheet_metal": "sheet_metal",
+    "laser_cutting": "laser_cutting",
+    "waterjet": "waterjet",
+    "3d_printing": "3d_printing",
+    "casting": "casting",
+    "welding": "welding",
+}
+
+
 def _manufacturing_method_from_process(process: str) -> str:
     token = str(process or "").strip().lower()
-    if token in {"cnc_turning", "cnc_milling"}:
-        return "cnc"
-    if token == "3d_printing":
-        return "3d_printing"
-    return "unknown"
+    return _PROCESS_TO_METHOD.get(token, "unknown")
 
 
 def _session_risk_flags(decision_json: dict[str, Any] | None) -> list[str]:
@@ -116,7 +162,7 @@ def _fallback_explanation() -> dict[str, Any]:
     return {
         "rule_id": "FALLBACK_NO_MATCH",
         "triggered": True,
-        "severity": "WARNING",
+        "severity": "MEDIUM",
         "reference": "rule_configs:fallback",
         "reasoning": "Fallback was used because explicit geometry or DFM evidence was incomplete.",
     }
@@ -242,8 +288,13 @@ def _build_engineering_analysis(
         except HTTPError:
             web_context = []
 
+    try:
+        resolved_file_id = normalize_scx_id(str(context.get("file_id") or ""))
+    except ValueError:
+        resolved_file_id = str(context.get("file_id") or "")
+
     return {
-        "file_id": normalize_scx_id(str(context.get("file_id") or "")),
+        "file_id": resolved_file_id,
         "filename": context.get("original_filename"),
         "content_type": context.get("content_type"),
         "status": context.get("status"),
@@ -315,10 +366,11 @@ def _memory_write(data: MemoryWriteIn) -> dict[str, Any]:
 
 
 def _memory_search(data: MemorySearchIn) -> dict[str, Any]:
+    safe_query = f"%{_escape_like(data.query.strip())}%"
     with db_session() as db:
         rows = db.execute(
             text(
-                """
+                r"""
                 SELECT
                   id,
                   task_query,
@@ -327,14 +379,14 @@ def _memory_search(data: MemorySearchIn) -> dict[str, Any]:
                   feedback_from_owner,
                   created_at
                 FROM experience_ledger
-                WHERE task_query ILIKE :query
-                   OR COALESCE(lessons_learned, '') ILIKE :query
-                   OR COALESCE(feedback_from_owner, '') ILIKE :query
+                WHERE task_query ILIKE :query ESCAPE '\'
+                   OR COALESCE(lessons_learned, '') ILIKE :query ESCAPE '\'
+                   OR COALESCE(feedback_from_owner, '') ILIKE :query ESCAPE '\'
                 ORDER BY created_at DESC
                 LIMIT :limit
                 """
             ),
-            {"query": f"%{data.query.strip()}%", "limit": data.limit},
+            {"query": safe_query, "limit": data.limit},
         ).mappings()
         items = [
             {
