@@ -1,52 +1,57 @@
 # STELL-AI Architecture
 
 ## Overview
-STELL-AI is the core intelligence layer of the STELLCODEX platform.
-It operates through a multi-agent architecture and a retrieval
-augmented reasoning system.
+STELL-AI is the intelligence authority of the STELLCODEX platform.
+It runs as a single FastAPI service (`runtime_app/`) that exposes
+deterministic plan, analyze, decide, and memory endpoints.
 
-The architecture is composed of three main layers:
+The architecture is composed of three layers:
 
-1. Agent Runtime
-2. Retrieval Layer
-3. Memory System
+1. Route / Endpoint Layer
+2. Intelligence Logic (classifiers, decision engine, analysis builders)
+3. Memory and Persistence (PostgreSQL via SQLAlchemy)
 
-## Agent Runtime
+## Current Runtime
 
-Agents operate in a coordinated system where each agent has a specific role.
+The active runtime is a single-process FastAPI application.
+There is no multi-agent framework, no agent event bus, and no
+orchestration layer in this repository.
 
-Core agents:
+Implemented endpoints:
+- POST /plan — task planning from prompt and optional file context
+- POST /analyze — engineering analysis of a file via backend context
+- POST /decide — deterministic decision authority with rule explanations
+- POST /memory/write — persist task experience to experience_ledger
+- POST /memory/search — ILIKE text search over experience_ledger
+- GET /capabilities — declared capability surface
+- GET /health — liveness probe
 
-Planner  
-Responsible for breaking down complex user requests into task graphs.
+## Intelligence Components
 
-Executor  
-Executes tasks such as tool calls, API requests and internal operations.
+MfgClassifier (`lib/mfg_classifier.py`)
+Pure-Python heuristic engine. Classifies manufacturing process from
+geometry metadata. No external dependencies.
 
-Researcher  
-Collects additional knowledge from retrieval layer.
+WebKnowledge (`lib/web_knowledge.py`)
+Web search fallback using DuckDuckGo and Wikipedia APIs.
+Called only when include_web_context=true on /analyze.
 
-Retriever  
-Queries vector databases and external knowledge sources.
+BackendClient (`lib/backend_client.py`)
+HTTP client for retrieving file context and rule config from the
+STELLCODEX backend internal API.
 
-Memory Manager  
-Maintains session and long-term memory state.
+## Safety Constraints
 
-## Execution Flow
+- All file_id inputs are validated as UUID or SCX ID format before
+  use in backend requests. Path-traversal characters are rejected.
+- Memory search queries escape LIKE metacharacters before use in
+  ILIKE predicates.
+- Decision mode is normalized to one of: brep, mesh_approx, visual_only.
+- Rule explanations use canonical severity values: HIGH, MEDIUM, LOW, INFO.
 
-User Input  
-→ Planner builds task graph  
-→ Executor agents perform tasks  
-→ Retriever gathers context  
-→ Memory Manager updates state  
-→ Response returned to user
+## Aspirational Design Note
 
-## Safety
-
-All agent actions must pass:
-
-permission validation  
-tenant isolation  
-tool safety checks
-
-No agent can access resources outside its tenant boundary.
+A multi-agent architecture with Planner, Executor, Researcher, Retriever,
+and Memory Manager agents is documented as a long-term design direction.
+It is NOT implemented in this repository. Do not claim closure of that
+architecture without verified code evidence.

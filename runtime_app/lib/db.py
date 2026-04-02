@@ -16,5 +16,8 @@ def db_session() -> Session:
     session = Session(_engine)
     try:
         yield session
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()
